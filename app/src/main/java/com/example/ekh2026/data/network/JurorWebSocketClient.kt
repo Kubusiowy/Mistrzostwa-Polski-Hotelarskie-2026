@@ -25,7 +25,7 @@ class JurorWebSocketClient(
         fun onSnapshot(snapshot: JurorSnapshot)
         fun onAck(action: String, message: String)
         fun onError(action: String, message: String)
-        fun onDisconnected(reason: String)
+        fun onDisconnected(reason: String, httpCode: Int?)
     }
 
     private var webSocket: WebSocket? = null
@@ -35,40 +35,53 @@ class JurorWebSocketClient(
         disconnect()
         manualClose.set(false)
 
-        val wsUrl = buildWebSocketUrl(accessToken) ?: run {
-            listener.onDisconnected("Nieprawidłowy adres WebSocket.")
+        val wsUrl = runCatching { buildWebSocketUrl(accessToken) }.getOrNull() ?: run {
+            listener.onDisconnected("Nieprawidłowy adres WebSocket.", null)
             return
         }
 
-        val request = Request.Builder()
-            .url(wsUrl)
-            .build()
+        val request = runCatching {
+            Request.Builder()
+                .url(wsUrl)
+                .build()
+        }.getOrElse {
+            listener.onDisconnected("Błędny URL WebSocket: ${it.message}", null)
+            return
+        }
 
-        webSocket = httpClient.newWebSocket(
-            request,
-            object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    listener.onSocketConnected()
-                }
+        webSocket = runCatching {
+            httpClient.newWebSocket(
+                request,
+                object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        listener.onSocketConnected()
+                    }
 
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    handleIncomingMessage(text)
-                }
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        handleIncomingMessage(text)
+                    }
 
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    if (!manualClose.get()) {
-                        listener.onDisconnected(reason.ifBlank { "Połączenie zamknięte." })
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        if (!manualClose.get()) {
+                            listener.onDisconnected(
+                                reason.ifBlank { "Połączenie zamknięte." },
+                                null
+                            )
+                        }
+                    }
+
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        if (!manualClose.get()) {
+                            val message = response?.message ?: t.message ?: "Błąd połączenia WebSocket."
+                            listener.onDisconnected(message, response?.code)
+                        }
                     }
                 }
-
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    if (!manualClose.get()) {
-                        val message = response?.message ?: t.message ?: "Błąd połączenia WebSocket."
-                        listener.onDisconnected(message)
-                    }
-                }
-            }
-        )
+            )
+        }.getOrElse {
+            listener.onDisconnected("Nie udało się uruchomić WebSocket: ${it.message}", null)
+            null
+        }
     }
 
     fun sendInit(): Boolean {
@@ -193,12 +206,16 @@ class JurorWebSocketClient(
 
     private fun buildWebSocketUrl(accessToken: String): String? {
         val httpUrl = baseUrl.toHttpUrlOrNull() ?: return null
-        val wsScheme = if (httpUrl.scheme == "https") "wss" else "ws"
-        return httpUrl.newBuilder()
-            .scheme(wsScheme)
+        val endpointHttpUrl = httpUrl.newBuilder()
             .addPathSegments("ws/juror/live")
             .addQueryParameter("token", accessToken)
             .build()
-            .toString()
+
+        val endpoint = endpointHttpUrl.toString()
+        return when (endpointHttpUrl.scheme) {
+            "https" -> endpoint.replaceFirst("https://", "wss://")
+            "http" -> endpoint.replaceFirst("http://", "ws://")
+            else -> null
+        }
     }
 }

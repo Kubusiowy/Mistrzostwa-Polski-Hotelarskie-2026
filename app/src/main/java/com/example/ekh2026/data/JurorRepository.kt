@@ -13,6 +13,7 @@ import com.example.ekh2026.data.network.AuthApi
 import com.example.ekh2026.data.network.JurorApi
 import com.example.ekh2026.data.storage.SessionStorage
 import com.squareup.moshi.Moshi
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import retrofit2.Response
@@ -82,9 +83,19 @@ class JurorRepository(
         sessionStorage.clear()
     }
 
-    suspend fun refreshAccessToken(): Boolean {
+    suspend fun refreshAccessToken(): RepoResult<Unit> {
         return refreshMutex.withLock {
-            val session = sessionStorage.readSession() ?: return@withLock false
+            val session = try {
+                sessionStorage.readSession()
+            } catch (_: Exception) {
+                return@withLock RepoResult.Err(
+                    0,
+                    "Nie udało się odczytać zapisanej sesji."
+                )
+            } ?: return@withLock RepoResult.Err(
+                401,
+                "Brak aktywnej sesji jurora."
+            )
 
             val response = try {
                 authApi.refreshAccessToken(
@@ -92,16 +103,32 @@ class JurorRepository(
                     body = RefreshRequest(refreshToken = session.refreshToken)
                 )
             } catch (_: Exception) {
-                return@withLock false
+                return@withLock RepoResult.Err(
+                    0,
+                    "Brak połączenia. Nie udało się odświeżyć sesji."
+                )
             }
 
             if (!response.isSuccessful) {
-                return@withLock false
+                return@withLock RepoResult.Err(response.code(), mapApiError(response))
             }
 
-            val newAccessToken = response.body()?.accessToken ?: return@withLock false
-            sessionStorage.updateAccessToken(newAccessToken)
-            true
+            val newAccessToken = response.body()?.accessToken
+                ?: return@withLock RepoResult.Err(
+                    500,
+                    "Brak nowego tokena dostępu w odpowiedzi od serwera."
+                )
+
+            try {
+                sessionStorage.updateAccessToken(newAccessToken)
+            } catch (_: Exception) {
+                return@withLock RepoResult.Err(
+                    0,
+                    "Nie udało się zapisać nowego tokena."
+                )
+            }
+
+            RepoResult.Ok(Unit)
         }
     }
 
@@ -157,24 +184,32 @@ class JurorRepository(
     private suspend fun <T> safeAuthorizedCall(
         apiCall: suspend (authorizationHeader: String) -> RepoResult<T>
     ): RepoResult<T> {
-        val session = sessionStorage.readSession()
-            ?: return RepoResult.Err(401, "Brak aktywnej sesji jurora.")
+        return safeApiCall {
+            val session = sessionStorage.readSession()
+                ?: return@safeApiCall RepoResult.Err(401, "Brak aktywnej sesji jurora.")
 
-        val firstTry = apiCall(bearer(session.accessToken))
-        if (firstTry !is RepoResult.Err || firstTry.code != 401) {
-            return firstTry
+            val firstTry = apiCall(bearer(session.accessToken))
+            if (firstTry !is RepoResult.Err || firstTry.code != 401) {
+                return@safeApiCall firstTry
+            }
+
+            when (val refreshResult = refreshAccessToken()) {
+                is RepoResult.Ok -> {
+                    val updatedSession = sessionStorage.readSession()
+                        ?: return@safeApiCall RepoResult.Err(401, "Sesja wygasła. Zaloguj się ponownie.")
+                    apiCall(bearer(updatedSession.accessToken))
+                }
+
+                is RepoResult.Err -> {
+                    if (refreshResult.code == 401) {
+                        sessionStorage.clear()
+                        RepoResult.Err(401, "Sesja wygasła. Zaloguj się ponownie.")
+                    } else {
+                        RepoResult.Err(refreshResult.code, refreshResult.message)
+                    }
+                }
+            }
         }
-
-        val refreshed = refreshAccessToken()
-        if (!refreshed) {
-            sessionStorage.clear()
-            return RepoResult.Err(401, "Sesja wygasła. Zaloguj się ponownie.")
-        }
-
-        val updatedSession = sessionStorage.readSession()
-            ?: return RepoResult.Err(401, "Sesja wygasła. Zaloguj się ponownie.")
-
-        return apiCall(bearer(updatedSession.accessToken))
     }
 
     private suspend fun <T> safeApiCall(
@@ -182,6 +217,8 @@ class JurorRepository(
     ): RepoResult<T> {
         return try {
             block()
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
         } catch (_: Exception) {
             RepoResult.Err(0, "Brak połączenia z serwerem. Sprawdź sieć i adres API.")
         }

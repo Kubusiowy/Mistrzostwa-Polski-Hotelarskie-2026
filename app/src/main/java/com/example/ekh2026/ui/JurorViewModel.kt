@@ -25,6 +25,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 private const val ROLE_JUROR = "JUROR"
+private const val WS_AUTH_UNAUTHORIZED = 401
+private const val WS_AUTH_FORBIDDEN = 403
+private const val WS_RECONNECT_MIN_DELAY_MS = 1_500L
+private const val WS_RECONNECT_MAX_DELAY_MS = 15_000L
 
 data class JurorUiState(
     val isStarting: Boolean = true,
@@ -44,6 +48,7 @@ data class JurorUiState(
     val scores: Map<String, Int> = emptyMap(),
     val draftScores: Map<String, Int> = emptyMap(),
     val selectedParticipantId: String? = null,
+    val selectedCategoryId: String? = null,
     val connectionNote: String = ""
 )
 
@@ -64,6 +69,8 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
         listener = object : JurorWebSocketClient.Listener {
             override fun onSocketConnected() {
                 viewModelScope.launch {
+                    reconnectJob?.cancel()
+                    reconnectAttempt = 0
                     _uiState.update {
                         it.copy(
                             wsConnected = true,
@@ -76,14 +83,25 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
 
             override fun onSnapshot(snapshot: JurorSnapshot) {
                 viewModelScope.launch {
-                    applySnapshot(snapshot)
-                    _uiState.update {
-                        it.copy(
-                            isDataLoading = false,
-                            isSavingScore = false,
-                            wsConnected = true,
-                            connectionNote = "Dane odświeżone live"
-                        )
+                    runCatching {
+                        applySnapshot(snapshot)
+                    }.onSuccess {
+                        _uiState.update {
+                            it.copy(
+                                isDataLoading = false,
+                                isSavingScore = false,
+                                wsConnected = true,
+                                connectionNote = "Dane odświeżone live"
+                            )
+                        }
+                    }.onFailure {
+                        _uiState.update {
+                            it.copy(
+                                isDataLoading = false,
+                                isSavingScore = false
+                            )
+                        }
+                        publishMessage("Błąd przetwarzania danych live. Spróbuj odświeżyć.")
                     }
                 }
             }
@@ -114,16 +132,18 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            override fun onDisconnected(reason: String) {
+            override fun onDisconnected(reason: String, httpCode: Int?) {
                 viewModelScope.launch {
+                    val isAuthError = httpCode == WS_AUTH_UNAUTHORIZED || httpCode == WS_AUTH_FORBIDDEN
                     _uiState.update {
                         it.copy(
                             wsConnected = false,
                             connectionNote = "Rozłączono live"
                         )
                     }
-                    publishMessage("Połączenie live przerwane: $reason")
-                    scheduleReconnect()
+                    val suffix = httpCode?.let { " (HTTP $it)" }.orEmpty()
+                    publishMessage("Połączenie live przerwane: $reason$suffix")
+                    scheduleReconnect(isAuthError = isAuthError)
                     if (_uiState.value.participants.isEmpty()) {
                         loadDataFromRest(showLoader = true)
                     }
@@ -140,6 +160,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
 
     private var reconnectJob: Job? = null
     private var shouldReconnect: Boolean = true
+    private var reconnectAttempt: Int = 0
 
     init {
         bootstrap()
@@ -218,6 +239,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             shouldReconnect = false
             reconnectJob?.cancel()
+            reconnectAttempt = 0
             websocketClient.disconnect()
             repository.clearSession()
 
@@ -249,6 +271,10 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectParticipant(participantId: String) {
         _uiState.update { it.copy(selectedParticipantId = participantId) }
+    }
+
+    fun selectCategory(categoryId: String?) {
+        _uiState.update { it.copy(selectedCategoryId = categoryId) }
     }
 
     fun updateDraftScore(participantId: String, criterionId: String, point: Int) {
@@ -353,23 +379,28 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            val refreshed = repository.refreshAccessToken()
-            if (!refreshed) {
-                repository.clearSession()
-                _uiState.update { it.copy(isStarting = false) }
-                checkLoginStatus()
-                return@launch
-            }
+            when (val refreshResult = repository.refreshAccessToken()) {
+                is RepoResult.Ok -> {
+                    val refreshedSession = repository.readSession() ?: session
+                    shouldReconnect = true
+                    reconnectAttempt = 0
+                    onSessionReady(refreshedSession)
+                }
 
-            val refreshedSession = repository.readSession()
-            if (refreshedSession == null) {
-                _uiState.update { it.copy(isStarting = false) }
-                checkLoginStatus()
-                return@launch
-            }
+                is RepoResult.Err -> {
+                    if (refreshResult.code == 401) {
+                        repository.clearSession()
+                        _uiState.update { it.copy(isStarting = false) }
+                        checkLoginStatus()
+                        return@launch
+                    }
 
-            shouldReconnect = true
-            onSessionReady(refreshedSession)
+                    shouldReconnect = true
+                    reconnectAttempt = 0
+                    onSessionReady(session)
+                    publishMessage("Przywrócono zapisane logowanie. ${refreshResult.message}")
+                }
+            }
         }
     }
 
@@ -439,27 +470,54 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
                     selected
                 } else {
                     snapshot.participants.firstOrNull()?.id
-                }
+                },
+                selectedCategoryId = state.selectedCategoryId.takeIf { selectedCategoryId ->
+                    snapshot.criteria.any { it.categoryId == selectedCategoryId }
+                } ?: snapshot.criteria.firstOrNull()?.categoryId
             )
         }
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(isAuthError: Boolean) {
         if (!shouldReconnect) return
+        if (_uiState.value.wsConnected) return
         if (reconnectJob?.isActive == true) return
 
+        val delayMs = calculateReconnectDelayMs(reconnectAttempt)
+        reconnectAttempt = (reconnectAttempt + 1).coerceAtMost(10)
+
         reconnectJob = viewModelScope.launch {
-            delay(1_500)
-            if (!shouldReconnect) return@launch
+            delay(delayMs)
+            if (!shouldReconnect || _uiState.value.wsConnected) return@launch
 
-            val refreshed = repository.refreshAccessToken()
-            if (!refreshed) {
-                forceLogout("Sesja wygasła. Zaloguj się ponownie.")
-                return@launch
+            if (isAuthError) {
+                when (val refreshResult = repository.refreshAccessToken()) {
+                    is RepoResult.Ok -> {
+                        connectWebSocket()
+                    }
+
+                    is RepoResult.Err -> {
+                        if (
+                            refreshResult.code == WS_AUTH_UNAUTHORIZED ||
+                            refreshResult.code == WS_AUTH_FORBIDDEN
+                        ) {
+                            forceLogout("Sesja wygasła. Zaloguj się ponownie.")
+                            return@launch
+                        }
+                        publishMessage("Nie udało się odświeżyć sesji. Ponawiam połączenie live.")
+                        connectWebSocket()
+                    }
+                }
+            } else {
+                connectWebSocket()
             }
-
-            connectWebSocket()
         }
+    }
+
+    private fun calculateReconnectDelayMs(attempt: Int): Long {
+        val boundedAttempt = attempt.coerceAtMost(4)
+        val factor = 1L shl boundedAttempt
+        return (WS_RECONNECT_MIN_DELAY_MS * factor).coerceAtMost(WS_RECONNECT_MAX_DELAY_MS)
     }
 
     private fun sendInitMessage() {
@@ -482,6 +540,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun forceLogout(message: String) {
         shouldReconnect = false
         reconnectJob?.cancel()
+        reconnectAttempt = 0
         websocketClient.disconnect()
         repository.clearSession()
 

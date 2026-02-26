@@ -104,6 +104,7 @@ fun JurorAppScreen(viewModel: JurorViewModel = viewModel()) {
                 else -> ScoresScreen(
                     state = state,
                     onSelectParticipant = viewModel::selectParticipant,
+                    onSelectCategory = viewModel::selectCategory,
                     onScoreChanged = viewModel::updateDraftScore,
                     onSaveScore = viewModel::submitScore,
                     onRefresh = viewModel::refreshData
@@ -300,6 +301,7 @@ private fun LoginScreen(
 private fun ScoresScreen(
     state: JurorUiState,
     onSelectParticipant: (String) -> Unit,
+    onSelectCategory: (String?) -> Unit,
     onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
     onSaveScore: (participantId: String, criterionId: String) -> Unit,
     onRefresh: () -> Unit
@@ -314,22 +316,66 @@ private fun ScoresScreen(
         return
     }
 
+    val selectedParticipantId = state.selectedParticipantId ?: state.participants.first().id
+    val categoryOptions = remember(state.criteria) {
+        state.criteria
+            .distinctBy { it.categoryId }
+            .map { it.categoryId to it.categoryName.ifBlank { "Pozostałe" } }
+            .sortedBy { it.second }
+    }
+
+    val selectedCategoryId = state.selectedCategoryId?.takeIf { selected ->
+        categoryOptions.any { it.first == selected }
+    } ?: categoryOptions.firstOrNull()?.first
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isTablet = maxWidth >= 900.dp
         if (isTablet) {
-            TabletLayout(
-                state = state,
-                onSelectParticipant = onSelectParticipant,
-                onScoreChanged = onScoreChanged,
-                onSaveScore = onSaveScore
-            )
+            Row(
+                modifier = Modifier.fillMaxSize(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                FiltersPanel(
+                    modifier = Modifier.width(340.dp),
+                    state = state,
+                    selectedParticipantId = selectedParticipantId,
+                    selectedCategoryId = selectedCategoryId,
+                    categoryOptions = categoryOptions,
+                    onSelectParticipant = onSelectParticipant,
+                    onSelectCategory = onSelectCategory
+                )
+                CriteriaPanel(
+                    modifier = Modifier.weight(1f),
+                    state = state,
+                    participantId = selectedParticipantId,
+                    selectedCategoryId = selectedCategoryId,
+                    onScoreChanged = onScoreChanged,
+                    onSaveScore = onSaveScore
+                )
+            }
         } else {
-            PhoneLayout(
-                state = state,
-                onSelectParticipant = onSelectParticipant,
-                onScoreChanged = onScoreChanged,
-                onSaveScore = onSaveScore
-            )
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                FiltersPanel(
+                    modifier = Modifier.fillMaxWidth(),
+                    state = state,
+                    selectedParticipantId = selectedParticipantId,
+                    selectedCategoryId = selectedCategoryId,
+                    categoryOptions = categoryOptions,
+                    onSelectParticipant = onSelectParticipant,
+                    onSelectCategory = onSelectCategory
+                )
+                CriteriaPanel(
+                    modifier = Modifier.fillMaxSize(),
+                    state = state,
+                    participantId = selectedParticipantId,
+                    selectedCategoryId = selectedCategoryId,
+                    onScoreChanged = onScoreChanged,
+                    onSaveScore = onSaveScore
+                )
+            }
         }
     }
 }
@@ -360,139 +406,122 @@ private fun EmptyScoresState(onRefresh: () -> Unit) {
     }
 }
 
-@Composable
-private fun TabletLayout(
-    state: JurorUiState,
-    onSelectParticipant: (String) -> Unit,
-    onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
-    onSaveScore: (participantId: String, criterionId: String) -> Unit
-) {
-    val selectedId = state.selectedParticipantId ?: state.participants.first().id
-    Row(
-        modifier = Modifier.fillMaxSize(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        OutlinedCard(
-            modifier = Modifier
-                .width(320.dp)
-                .fillMaxHeight()
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text(
-                    text = "Uczestnicy",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(Modifier.height(8.dp))
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(state.participants, key = { it.id }) { participant ->
-                        val isSelected = participant.id == selectedId
-                        OutlinedCard(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onSelectParticipant(participant.id) },
-                            colors = if (isSelected) {
-                                CardDefaults.outlinedCardColors(
-                                    containerColor = MaterialTheme.colorScheme.secondaryContainer
-                                )
-                            } else {
-                                CardDefaults.outlinedCardColors()
-                            }
-                        ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                Text(
-                                    text = "${participant.name} ${participant.surname}",
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = participant.schoolName,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        CriteriaPanel(
-            modifier = Modifier.weight(1f),
-            state = state,
-            participantId = selectedId,
-            onScoreChanged = onScoreChanged,
-            onSaveScore = onSaveScore
-        )
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PhoneLayout(
+private fun FiltersPanel(
+    modifier: Modifier,
     state: JurorUiState,
+    selectedParticipantId: String,
+    selectedCategoryId: String?,
+    categoryOptions: List<Pair<String, String>>,
     onSelectParticipant: (String) -> Unit,
-    onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
-    onSaveScore: (participantId: String, criterionId: String) -> Unit
+    onSelectCategory: (String?) -> Unit
 ) {
-    val selectedId = state.selectedParticipantId ?: state.participants.first().id
-    val selectedParticipant = state.participants.firstOrNull { it.id == selectedId }
-    var expanded by remember { mutableStateOf(false) }
+    val selectedParticipant = state.participants.firstOrNull { it.id == selectedParticipantId }
+    val selectedCategoryName = selectedCategoryId?.let { selected ->
+        categoryOptions.firstOrNull { it.first == selected }?.second
+    } ?: "Wszystkie kategorie"
 
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text(
-                    text = "Oceniany uczestnik",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
+    var participantExpanded by remember { mutableStateOf(false) }
+    var categoryExpanded by remember { mutableStateOf(false) }
+
+    OutlinedCard(modifier = modifier) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Wybór oceniania",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "Najpierw wybierz uczestnika i kategorię.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            ExposedDropdownMenuBox(
+                expanded = participantExpanded,
+                onExpandedChange = { participantExpanded = !participantExpanded }
+            ) {
+                OutlinedTextField(
+                    modifier = Modifier
+                        .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                        .fillMaxWidth(),
+                    readOnly = true,
+                    value = selectedParticipant?.let { "${it.name} ${it.surname}" } ?: "",
+                    onValueChange = {},
+                    label = { Text("Uczestnik") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = participantExpanded) }
                 )
-                Spacer(Modifier.height(8.dp))
-                ExposedDropdownMenuBox(
-                    expanded = expanded,
-                    onExpandedChange = { expanded = !expanded }
-                ) {
-                    OutlinedTextField(
-                        modifier = Modifier
-                            .menuAnchor(MenuAnchorType.PrimaryNotEditable)
-                            .fillMaxWidth(),
-                        readOnly = true,
-                        value = selectedParticipant?.let { "${it.name} ${it.surname}" } ?: "",
-                        onValueChange = {},
-                        label = { Text("Uczestnik") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) }
-                    )
 
-                    DropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        state.participants.forEach { participant ->
-                            DropdownMenuItem(
-                                text = { Text("${participant.name} ${participant.surname}") },
-                                onClick = {
-                                    onSelectParticipant(participant.id)
-                                    expanded = false
-                                }
-                            )
-                        }
+                DropdownMenu(
+                    expanded = participantExpanded,
+                    onDismissRequest = { participantExpanded = false }
+                ) {
+                    state.participants.forEach { participant ->
+                        DropdownMenuItem(
+                            text = { Text("${participant.name} ${participant.surname}") },
+                            onClick = {
+                                onSelectParticipant(participant.id)
+                                participantExpanded = false
+                            }
+                        )
                     }
                 }
             }
-        }
 
-        CriteriaPanel(
-            modifier = Modifier.fillMaxSize(),
-            state = state,
-            participantId = selectedId,
-            onScoreChanged = onScoreChanged,
-            onSaveScore = onSaveScore
-        )
+            ExposedDropdownMenuBox(
+                expanded = categoryExpanded,
+                onExpandedChange = { categoryExpanded = !categoryExpanded }
+            ) {
+                OutlinedTextField(
+                    modifier = Modifier
+                        .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                        .fillMaxWidth(),
+                    readOnly = true,
+                    value = selectedCategoryName,
+                    onValueChange = {},
+                    label = { Text("Kategoria") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = categoryExpanded) }
+                )
+
+                DropdownMenu(
+                    expanded = categoryExpanded,
+                    onDismissRequest = { categoryExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Wszystkie kategorie") },
+                        onClick = {
+                            onSelectCategory(null)
+                            categoryExpanded = false
+                        }
+                    )
+                    categoryOptions.forEach { category ->
+                        DropdownMenuItem(
+                            text = { Text(category.second) },
+                            onClick = {
+                                onSelectCategory(category.first)
+                                categoryExpanded = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            if (selectedParticipant != null) {
+                Text(
+                    text = selectedParticipant.schoolName,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
     }
 }
 
@@ -501,13 +530,22 @@ private fun CriteriaPanel(
     modifier: Modifier,
     state: JurorUiState,
     participantId: String,
+    selectedCategoryId: String?,
     onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
     onSaveScore: (participantId: String, criterionId: String) -> Unit
 ) {
-    val groupedCriteria = remember(state.criteria) {
-        state.criteria
-            .sortedWith(compareBy<CriterionDto> { it.categoryName }.thenBy { it.name })
-            .groupBy { it.categoryName.ifBlank { "Pozostałe" } }
+    val filteredCriteria = remember(state.criteria, selectedCategoryId) {
+        val base = if (selectedCategoryId == null) {
+            state.criteria
+        } else {
+            state.criteria.filter { it.categoryId == selectedCategoryId }
+        }
+
+        base.sortedWith(compareBy<CriterionDto> { it.categoryName }.thenBy { it.name })
+    }
+
+    val groupedCriteria = remember(filteredCriteria) {
+        filteredCriteria.groupBy { it.categoryName.ifBlank { "Pozostałe" } }
     }
 
     OutlinedCard(modifier = modifier) {
@@ -527,6 +565,19 @@ private fun CriteriaPanel(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(Modifier.height(8.dp))
+
+            if (groupedCriteria.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Brak kryteriów w wybranej kategorii.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                return@Column
+            }
 
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
