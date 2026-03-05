@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -16,8 +17,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -26,6 +31,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
@@ -48,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -56,9 +63,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ekh2026.BuildConfig
 import com.example.ekh2026.data.model.CriterionDto
+import com.example.ekh2026.data.model.resolvedInfo
 import com.example.ekh2026.data.model.scoreKey
 import kotlinx.coroutines.flow.collectLatest
 import kotlin.math.roundToInt
+
+private data class CategoryFilterItem(
+    val id: String,
+    val name: String,
+    val isCompleted: Boolean
+)
 
 @Composable
 fun JurorAppScreen(viewModel: JurorViewModel = viewModel()) {
@@ -317,16 +331,31 @@ private fun ScoresScreen(
     }
 
     val selectedParticipantId = state.selectedParticipantId ?: state.participants.first().id
-    val categoryOptions = remember(state.criteria) {
+    val categoryItems = remember(
+        state.criteria,
+        state.scores,
+        state.draftScores,
+        selectedParticipantId
+    ) {
         state.criteria
-            .distinctBy { it.categoryId }
-            .map { it.categoryId to it.categoryName.ifBlank { "Pozostałe" } }
-            .sortedBy { it.second }
+            .groupBy { it.categoryId }
+            .map { (categoryId, criteriaInCategory) ->
+                val isCompleted = criteriaInCategory.isNotEmpty() && criteriaInCategory.all { criterion ->
+                    val key = scoreKey(selectedParticipantId, criterion.id)
+                    state.scores.containsKey(key) || state.draftScores.containsKey(key)
+                }
+                CategoryFilterItem(
+                    id = categoryId,
+                    name = criteriaInCategory.first().categoryName.ifBlank { "Pozostałe" },
+                    isCompleted = isCompleted
+                )
+            }
+            .sortedBy { it.name }
     }
 
     val selectedCategoryId = state.selectedCategoryId?.takeIf { selected ->
-        categoryOptions.any { it.first == selected }
-    } ?: categoryOptions.firstOrNull()?.first
+        categoryItems.any { it.id == selected }
+    }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isTablet = maxWidth >= 900.dp
@@ -340,7 +369,7 @@ private fun ScoresScreen(
                     state = state,
                     selectedParticipantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
-                    categoryOptions = categoryOptions,
+                    categoryItems = categoryItems,
                     onSelectParticipant = onSelectParticipant,
                     onSelectCategory = onSelectCategory
                 )
@@ -363,7 +392,7 @@ private fun ScoresScreen(
                     state = state,
                     selectedParticipantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
-                    categoryOptions = categoryOptions,
+                    categoryItems = categoryItems,
                     onSelectParticipant = onSelectParticipant,
                     onSelectCategory = onSelectCategory
                 )
@@ -413,13 +442,13 @@ private fun FiltersPanel(
     state: JurorUiState,
     selectedParticipantId: String,
     selectedCategoryId: String?,
-    categoryOptions: List<Pair<String, String>>,
+    categoryItems: List<CategoryFilterItem>,
     onSelectParticipant: (String) -> Unit,
     onSelectCategory: (String?) -> Unit
 ) {
     val selectedParticipant = state.participants.firstOrNull { it.id == selectedParticipantId }
     val selectedCategoryName = selectedCategoryId?.let { selected ->
-        categoryOptions.firstOrNull { it.first == selected }?.second
+        categoryItems.firstOrNull { it.id == selected }?.name
     } ?: "Wszystkie kategorie"
 
     var participantExpanded by remember { mutableStateOf(false) }
@@ -500,14 +529,69 @@ private fun FiltersPanel(
                             categoryExpanded = false
                         }
                     )
-                    categoryOptions.forEach { category ->
+                    categoryItems.forEach { category ->
                         DropdownMenuItem(
-                            text = { Text(category.second) },
+                            text = {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(category.name)
+                                    if (category.isCompleted) {
+                                        Text(
+                                            text = "oceniona",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            },
                             onClick = {
-                                onSelectCategory(category.first)
+                                onSelectCategory(category.id)
                                 categoryExpanded = false
                             }
                         )
+                    }
+                }
+            }
+
+            Text(
+                text = "Status kategorii (dla wybranego uczestnika)",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(categoryItems, key = { it.id }) { category ->
+                    val isSelected = category.id == selectedCategoryId
+                    val containerColor = when {
+                        isSelected -> MaterialTheme.colorScheme.secondaryContainer
+                        category.isCompleted -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+                        else -> MaterialTheme.colorScheme.surface
+                    }
+
+                    OutlinedCard(
+                        modifier = Modifier.clickable { onSelectCategory(category.id) },
+                        colors = CardDefaults.outlinedCardColors(containerColor = containerColor)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = category.name,
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                            if (category.isCompleted) {
+                                Text(
+                                    text = "✓",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -534,6 +618,8 @@ private fun CriteriaPanel(
     onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
     onSaveScore: (participantId: String, criterionId: String) -> Unit
 ) {
+    var criterionInfoDialogItem by remember { mutableStateOf<CriterionDto?>(null) }
+
     val filteredCriteria = remember(state.criteria, selectedCategoryId) {
         val base = if (selectedCategoryId == null) {
             state.criteria
@@ -604,6 +690,9 @@ private fun CriteriaPanel(
                             criterion = criterion,
                             point = currentPoint,
                             isSaving = state.isSavingScore,
+                            onInfoClick = {
+                                criterionInfoDialogItem = criterion
+                            },
                             onPointChanged = { value ->
                                 onScoreChanged(participantId, criterion.id, value)
                             },
@@ -616,6 +705,15 @@ private fun CriteriaPanel(
             }
         }
     }
+
+    val selectedInfo = criterionInfoDialogItem?.resolvedInfo()?.takeIf { it.isNotBlank() }
+    if (selectedInfo != null) {
+        CriterionInfoDialog(
+            title = criterionInfoDialogItem?.name.orEmpty(),
+            info = selectedInfo,
+            onDismiss = { criterionInfoDialogItem = null }
+        )
+    }
 }
 
 @Composable
@@ -623,9 +721,12 @@ private fun CriterionScoreRow(
     criterion: CriterionDto,
     point: Int,
     isSaving: Boolean,
+    onInfoClick: () -> Unit,
     onPointChanged: (Int) -> Unit,
     onCommit: () -> Unit
 ) {
+    val hasInfo = !criterion.resolvedInfo().isNullOrBlank()
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -636,19 +737,48 @@ private fun CriterionScoreRow(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = criterion.name,
+            Row(
                 modifier = Modifier.weight(1f),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                fontWeight = FontWeight.Medium
-            )
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (hasInfo) {
+                    IconButton(
+                        onClick = onInfoClick,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Color(0xFFD32F2F)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "i",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = criterion.name,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.Medium
+                )
+            }
             Spacer(Modifier.width(8.dp))
-            Text(
-                text = "$point / ${criterion.maxPoints}",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "$point / ${criterion.maxPoints}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
 
         Slider(
@@ -671,6 +801,34 @@ private fun CriterionScoreRow(
 
         HorizontalDivider(modifier = Modifier.padding(top = 8.dp))
     }
+}
+
+@Composable
+private fun CriterionInfoDialog(
+    title: String,
+    info: String,
+    onDismiss: () -> Unit
+) {
+    val scrollState = rememberScrollState()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(text = title) },
+        text = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 360.dp)
+                    .verticalScroll(scrollState)
+            ) {
+                Text(text = info)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Zamknij")
+            }
+        }
+    )
 }
 
 private fun currentScore(

@@ -37,6 +37,9 @@ data class CriterionDto(
     val categoryId: String,
     val categoryName: String,
     val name: String,
+    val info: String? = null,
+    val description: String? = null,
+    val criterionInfo: String? = null,
     val maxPoints: Int
 )
 
@@ -68,3 +71,9 @@ data class JurorSnapshot(
 )
 
 fun scoreKey(participantId: String, criterionId: String): String = "$participantId|$criterionId"
+
+fun CriterionDto.resolvedInfo(): String? {
+    return listOf(info, description, criterionInfo)
+        .firstOrNull { !it.isNullOrBlank() }
+        ?.trim()
+}

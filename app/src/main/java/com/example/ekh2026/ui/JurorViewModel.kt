@@ -11,6 +11,7 @@ import com.example.ekh2026.data.model.JurorSession
 import com.example.ekh2026.data.model.JurorSnapshot
 import com.example.ekh2026.data.model.ParticipantDto
 import com.example.ekh2026.data.model.UpsertMyScoreRequest
+import com.example.ekh2026.data.model.resolvedInfo
 import com.example.ekh2026.data.model.scoreKey
 import com.example.ekh2026.data.network.JurorApiServiceFactory
 import com.example.ekh2026.data.network.JurorWebSocketClient
@@ -449,32 +450,56 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun applySnapshot(snapshot: JurorSnapshot) {
+        val sortedParticipants = snapshot.participants.sortedWith(
+            compareBy<ParticipantDto> { it.surname.trim().lowercase() }
+                .thenBy { it.name.trim().lowercase() }
+                .thenBy { it.id }
+        )
+
         val scoreMap = snapshot.scores.associate { score ->
             scoreKey(score.participantId, score.criterionId) to score.point
         }
 
         _uiState.update { state ->
+            val mergedCriteria = mergeCriteriaInfo(
+                previousCriteria = state.criteria,
+                incomingCriteria = snapshot.criteria
+            )
             val selected = state.selectedParticipantId
-            val selectedStillExists = snapshot.participants.any { it.id == selected }
+            val selectedStillExists = sortedParticipants.any { it.id == selected }
             state.copy(
-                participants = snapshot.participants,
-                criteria = snapshot.criteria,
+                participants = sortedParticipants,
+                criteria = mergedCriteria,
                 scores = scoreMap,
                 draftScores = state.draftScores.filterKeys { key ->
                     val parts = key.split('|')
                     if (parts.size != 2) return@filterKeys false
-                    snapshot.participants.any { it.id == parts[0] } &&
-                        snapshot.criteria.any { it.id == parts[1] }
+                    sortedParticipants.any { it.id == parts[0] } &&
+                        mergedCriteria.any { it.id == parts[1] }
                 },
                 selectedParticipantId = if (selectedStillExists) {
                     selected
                 } else {
-                    snapshot.participants.firstOrNull()?.id
+                    sortedParticipants.firstOrNull()?.id
                 },
                 selectedCategoryId = state.selectedCategoryId.takeIf { selectedCategoryId ->
-                    snapshot.criteria.any { it.categoryId == selectedCategoryId }
-                } ?: snapshot.criteria.firstOrNull()?.categoryId
+                    mergedCriteria.any { it.categoryId == selectedCategoryId }
+                }
             )
+        }
+    }
+
+    private fun mergeCriteriaInfo(
+        previousCriteria: List<CriterionDto>,
+        incomingCriteria: List<CriterionDto>
+    ): List<CriterionDto> {
+        if (previousCriteria.isEmpty()) return incomingCriteria
+
+        val previousInfoById = previousCriteria.associate { it.id to it.resolvedInfo() }
+        return incomingCriteria.map { incoming ->
+            if (!incoming.resolvedInfo().isNullOrBlank()) return@map incoming
+            val previousInfo = previousInfoById[incoming.id]
+            if (previousInfo.isNullOrBlank()) incoming else incoming.copy(info = previousInfo)
         }
     }
 

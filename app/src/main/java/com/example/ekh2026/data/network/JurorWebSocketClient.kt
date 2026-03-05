@@ -180,6 +180,9 @@ class JurorWebSocketClient(
                         categoryId = item.optString("categoryId"),
                         categoryName = item.optString("categoryName"),
                         name = item.optString("name"),
+                        info = item.optNullableString("info")
+                            ?: item.optNullableString("description")
+                            ?: item.optNullableString("criterionInfo"),
                         maxPoints = item.optInt("maxPoints", 0)
                     )
                 )
@@ -215,6 +218,15 @@ class JurorWebSocketClient(
         return when (endpointHttpUrl.scheme) {
             "https" -> endpoint.replaceFirst("https://", "wss://")
             "http" -> endpoint.replaceFirst("http://", "ws://")
+            else -> null
+        }
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? {
+        val value = opt(key)
+        return when (value) {
+            JSONObject.NULL -> null
+            is String -> value
             else -> null
         }
     }
