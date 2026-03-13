@@ -1,6 +1,11 @@
 package com.example.ekh2026.ui
 
 import android.app.Application
+import android.os.Build
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ekh2026.BuildConfig
@@ -33,6 +38,7 @@ private const val WS_RECONNECT_MAX_DELAY_MS = 15_000L
 
 data class JurorUiState(
     val isStarting: Boolean = true,
+    val hasInternet: Boolean = true,
     val isAuthenticated: Boolean = false,
     val jurorDisplayName: String = "",
     val firstNameInput: String = "",
@@ -56,6 +62,7 @@ data class JurorUiState(
 class JurorViewModel(application: Application) : AndroidViewModel(application) {
 
     private val sessionStorage = SecureSessionStorage(application)
+    private val connectivityManager = application.getSystemService(ConnectivityManager::class.java)
     private val network = JurorApiServiceFactory.create(BuildConfig.API_BASE_URL)
 
     private val repository = JurorRepository(
@@ -136,12 +143,14 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
             override fun onDisconnected(reason: String, httpCode: Int?) {
                 viewModelScope.launch {
                     val isAuthError = httpCode == WS_AUTH_UNAUTHORIZED || httpCode == WS_AUTH_FORBIDDEN
+                    val hasInternet = _uiState.value.hasInternet
                     _uiState.update {
                         it.copy(
                             wsConnected = false,
-                            connectionNote = "Rozłączono live"
+                            connectionNote = if (hasInternet) "Rozłączono live" else "Brak internetu"
                         )
                     }
+                    if (!hasInternet) return@launch
                     val suffix = httpCode?.let { " (HTTP $it)" }.orEmpty()
                     publishMessage("Połączenie live przerwane: $reason$suffix")
                     scheduleReconnect(isAuthError = isAuthError)
@@ -152,6 +161,28 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     )
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            setInternetAvailability(hasInternetAccess(network))
+        }
+
+        override fun onLost(network: Network) {
+            setInternetAvailability(false)
+        }
+
+        override fun onUnavailable() {
+            setInternetAvailability(false)
+        }
+
+        override fun onLosing(network: Network, maxMsToLive: Int) {
+            setInternetAvailability(false)
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            setInternetAvailability(hasInternetAccess(networkCapabilities))
+        }
+    }
 
     private val _uiState = MutableStateFlow(JurorUiState())
     val uiState = _uiState.asStateFlow()
@@ -164,6 +195,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     private var reconnectAttempt: Int = 0
 
     init {
+        startNetworkMonitoring()
         bootstrap()
     }
 
@@ -180,6 +212,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkLoginStatus() {
+        if (!_uiState.value.hasInternet) return
         viewModelScope.launch {
             when (val statusResult = repository.checkJurorLoginStatus()) {
                 is RepoResult.Ok -> {
@@ -206,6 +239,11 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     fun login() {
         viewModelScope.launch {
             val state = _uiState.value
+            if (!state.hasInternet) {
+                publishMessage("Brak internetu. Połącz się z siecią i spróbuj ponownie.")
+                return@launch
+            }
+
             val firstName = state.firstNameInput.trim()
             val surName = state.surNameInput.trim()
             val adminPassword = state.adminPasswordInput
@@ -260,6 +298,13 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshData() {
+        if (!_uiState.value.hasInternet) {
+            viewModelScope.launch {
+                publishMessage("Brak internetu. Ekran oceniania wróci automatycznie po odzyskaniu połączenia.")
+            }
+            return
+        }
+
         if (_uiState.value.isAuthenticated) {
             loadDataFromRest(showLoader = true)
             if (!_uiState.value.wsConnected) {
@@ -279,6 +324,8 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateDraftScore(participantId: String, criterionId: String, point: Int) {
+        if (!_uiState.value.hasInternet) return
+
         val criterion = _uiState.value.criteria.firstOrNull { it.id == criterionId } ?: return
         val safePoint = point.coerceIn(0, criterion.maxPoints)
         val key = scoreKey(participantId, criterionId)
@@ -294,6 +341,10 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val state = _uiState.value
             if (state.isSavingScore) return@launch
+            if (!state.hasInternet) {
+                publishMessage("Brak internetu. Zapis oceny będzie możliwy po odzyskaniu połączenia.")
+                return@launch
+            }
 
             val criterion = state.criteria.firstOrNull { it.id == criterionId }
             if (criterion == null) {
@@ -365,6 +416,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         shouldReconnect = false
         reconnectJob?.cancel()
+        runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         websocketClient.disconnect()
         super.onCleared()
     }
@@ -377,6 +429,13 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
             if (session == null || session.role != ROLE_JUROR) {
                 _uiState.update { it.copy(isStarting = false) }
                 checkLoginStatus()
+                return@launch
+            }
+
+            if (!_uiState.value.hasInternet) {
+                shouldReconnect = true
+                reconnectAttempt = 0
+                onSessionReady(session)
                 return@launch
             }
 
@@ -422,6 +481,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun connectWebSocket() {
+        if (!_uiState.value.hasInternet) return
         viewModelScope.launch {
             if (!shouldReconnect) return@launch
             val session = repository.readSession() ?: return@launch
@@ -430,6 +490,11 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadDataFromRest(showLoader: Boolean) {
+        if (!_uiState.value.hasInternet) {
+            _uiState.update { it.copy(isDataLoading = false) }
+            return
+        }
+
         viewModelScope.launch {
             if (showLoader) {
                 _uiState.update { it.copy(isDataLoading = true) }
@@ -505,6 +570,7 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun scheduleReconnect(isAuthError: Boolean) {
         if (!shouldReconnect) return
+        if (!_uiState.value.hasInternet) return
         if (_uiState.value.wsConnected) return
         if (reconnectJob?.isActive == true) return
 
@@ -588,5 +654,71 @@ class JurorViewModel(application: Application) : AndroidViewModel(application) {
         if (message.isNotBlank()) {
             _messages.emit(message)
         }
+    }
+
+    private fun startNetworkMonitoring() {
+        setInternetAvailability(isInternetCurrentlyAvailable())
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
+            return
+        }
+
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        connectivityManager.registerNetworkCallback(request, networkCallback)
+    }
+
+    private fun setInternetAvailability(isInternetAvailable: Boolean) {
+        val wasInternetAvailable = _uiState.value.hasInternet
+
+        if (wasInternetAvailable == isInternetAvailable) return
+
+        _uiState.update {
+            it.copy(
+                hasInternet = isInternetAvailable,
+                wsConnected = if (isInternetAvailable) it.wsConnected else false,
+                connectionNote = if (isInternetAvailable) it.connectionNote else "Brak internetu",
+                isDataLoading = if (isInternetAvailable) it.isDataLoading else false,
+                isSavingScore = if (isInternetAvailable) it.isSavingScore else false
+            )
+        }
+
+        if (!isInternetAvailable) {
+            reconnectJob?.cancel()
+            websocketClient.disconnect()
+            viewModelScope.launch {
+                publishMessage("Brak internetu. Pokażę ekran offline do czasu odzyskania połączenia.")
+            }
+            return
+        }
+
+        reconnectAttempt = 0
+        viewModelScope.launch {
+            if (_uiState.value.isAuthenticated) {
+                publishMessage("Internet wrócił. Wracam do oceniania.")
+                loadDataFromRest(showLoader = _uiState.value.participants.isEmpty())
+                connectWebSocket()
+            } else {
+                checkLoginStatus()
+            }
+        }
+    }
+
+    private fun isInternetCurrentlyAvailable(): Boolean {
+        val activeNetwork = connectivityManager.activeNetwork ?: return false
+        return hasInternetAccess(activeNetwork)
+    }
+
+    private fun hasInternetAccess(network: Network): Boolean {
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return hasInternetAccess(capabilities)
+    }
+
+    private fun hasInternetAccess(capabilities: NetworkCapabilities?): Boolean {
+        if (capabilities == null) return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 }

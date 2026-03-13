@@ -74,6 +74,11 @@ private data class CategoryFilterItem(
     val isCompleted: Boolean
 )
 
+private data class PendingScoresNavigation(
+    val participantId: String? = null,
+    val categoryId: String? = null
+)
+
 @Composable
 fun JurorAppScreen(viewModel: JurorViewModel = viewModel()) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -87,7 +92,7 @@ fun JurorAppScreen(viewModel: JurorViewModel = viewModel()) {
 
     Scaffold(
         topBar = {
-            if (state.isAuthenticated) {
+            if (state.isAuthenticated && state.hasInternet) {
                 JurorTopBar(
                     jurorName = state.jurorDisplayName,
                     wsConnected = state.wsConnected,
@@ -106,6 +111,7 @@ fun JurorAppScreen(viewModel: JurorViewModel = viewModel()) {
         ) {
             when {
                 state.isStarting -> FullscreenLoading("Uruchamianie aplikacji jurora...")
+                !state.hasInternet -> OfflineScreen(isAuthenticated = state.isAuthenticated)
                 !state.isAuthenticated -> LoginScreen(
                     state = state,
                     onFirstNameChanged = viewModel::onFirstNameChanged,
@@ -138,6 +144,42 @@ private fun FullscreenLoading(label: String) {
         CircularProgressIndicator()
         Spacer(Modifier.height(12.dp))
         Text(label)
+    }
+}
+
+@Composable
+private fun OfflineScreen(isAuthenticated: Boolean) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        OutlinedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .width(560.dp),
+            colors = CardDefaults.outlinedCardColors()
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Brak internetu",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Połączenie z siecią zostało przerwane.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    text = if (isAuthenticated) {
+                        "Gdy internet wróci, aplikacja automatycznie przejdzie z powrotem do oceniania."
+                    } else {
+                        "Gdy internet wróci, ekran zniknie automatycznie i będzie można kontynuować pracę."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 
@@ -331,6 +373,9 @@ private fun ScoresScreen(
     }
 
     val selectedParticipantId = state.selectedParticipantId ?: state.participants.first().id
+    var pendingNavigation by remember(selectedParticipantId, state.selectedCategoryId) {
+        mutableStateOf<PendingScoresNavigation?>(null)
+    }
     val categoryItems = remember(
         state.criteria,
         state.scores,
@@ -355,6 +400,47 @@ private fun ScoresScreen(
 
     val selectedCategoryId = state.selectedCategoryId?.takeIf { selected ->
         categoryItems.any { it.id == selected }
+    } ?: categoryItems.firstOrNull()?.id
+
+    LaunchedEffect(categoryItems, state.selectedCategoryId) {
+        val firstCategoryId = categoryItems.firstOrNull()?.id ?: return@LaunchedEffect
+        val currentCategoryId = state.selectedCategoryId
+        val currentCategoryExists = currentCategoryId != null && categoryItems.any { it.id == currentCategoryId }
+        if (!currentCategoryExists) {
+            onSelectCategory(firstCategoryId)
+        }
+    }
+
+    val currentSelectionHasIncompleteScores = remember(
+        state.criteria,
+        state.scores,
+        state.draftScores,
+        selectedParticipantId,
+        selectedCategoryId
+    ) {
+        hasIncompleteScores(
+            state = state,
+            participantId = selectedParticipantId,
+            selectedCategoryId = selectedCategoryId
+        )
+    }
+
+    fun handleParticipantChange(participantId: String) {
+        if (participantId == selectedParticipantId) return
+        if (currentSelectionHasIncompleteScores) {
+            pendingNavigation = PendingScoresNavigation(participantId = participantId)
+        } else {
+            onSelectParticipant(participantId)
+        }
+    }
+
+    fun handleCategoryChange(categoryId: String?) {
+        if (categoryId == selectedCategoryId) return
+        if (currentSelectionHasIncompleteScores) {
+            pendingNavigation = PendingScoresNavigation(categoryId = categoryId)
+        } else {
+            onSelectCategory(categoryId)
+        }
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -370,12 +456,13 @@ private fun ScoresScreen(
                     selectedParticipantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
                     categoryItems = categoryItems,
-                    onSelectParticipant = onSelectParticipant,
-                    onSelectCategory = onSelectCategory
+                    onSelectParticipant = ::handleParticipantChange,
+                    onSelectCategory = ::handleCategoryChange
                 )
                 CriteriaPanel(
                     modifier = Modifier.weight(1f),
                     state = state,
+                    isOnline = state.hasInternet,
                     participantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
                     onScoreChanged = onScoreChanged,
@@ -393,12 +480,13 @@ private fun ScoresScreen(
                     selectedParticipantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
                     categoryItems = categoryItems,
-                    onSelectParticipant = onSelectParticipant,
-                    onSelectCategory = onSelectCategory
+                    onSelectParticipant = ::handleParticipantChange,
+                    onSelectCategory = ::handleCategoryChange
                 )
                 CriteriaPanel(
                     modifier = Modifier.fillMaxSize(),
                     state = state,
+                    isOnline = state.hasInternet,
                     participantId = selectedParticipantId,
                     selectedCategoryId = selectedCategoryId,
                     onScoreChanged = onScoreChanged,
@@ -406,6 +494,20 @@ private fun ScoresScreen(
                 )
             }
         }
+    }
+
+    if (pendingNavigation != null) {
+        IncompleteScoresDialog(
+            message = incompleteScoresMessage(selectedCategoryId = selectedCategoryId),
+            onDismiss = { pendingNavigation = null },
+            onConfirm = {
+                pendingNavigation?.participantId?.let(onSelectParticipant)
+                if (pendingNavigation?.participantId == null) {
+                    onSelectCategory(pendingNavigation?.categoryId)
+                }
+                pendingNavigation = null
+            }
+        )
     }
 }
 
@@ -449,7 +551,7 @@ private fun FiltersPanel(
     val selectedParticipant = state.participants.firstOrNull { it.id == selectedParticipantId }
     val selectedCategoryName = selectedCategoryId?.let { selected ->
         categoryItems.firstOrNull { it.id == selected }?.name
-    } ?: "Wszystkie kategorie"
+    }.orEmpty()
 
     var participantExpanded by remember { mutableStateOf(false) }
     var categoryExpanded by remember { mutableStateOf(false) }
@@ -522,13 +624,6 @@ private fun FiltersPanel(
                     expanded = categoryExpanded,
                     onDismissRequest = { categoryExpanded = false }
                 ) {
-                    DropdownMenuItem(
-                        text = { Text("Wszystkie kategorie") },
-                        onClick = {
-                            onSelectCategory(null)
-                            categoryExpanded = false
-                        }
-                    )
                     categoryItems.forEach { category ->
                         DropdownMenuItem(
                             text = {
@@ -613,6 +708,7 @@ private fun FiltersPanel(
 private fun CriteriaPanel(
     modifier: Modifier,
     state: JurorUiState,
+    isOnline: Boolean,
     participantId: String,
     selectedCategoryId: String?,
     onScoreChanged: (participantId: String, criterionId: String, point: Int) -> Unit,
@@ -689,6 +785,7 @@ private fun CriteriaPanel(
                         CriterionScoreRow(
                             criterion = criterion,
                             point = currentPoint,
+                            isOnline = isOnline,
                             isSaving = state.isSavingScore,
                             onInfoClick = {
                                 criterionInfoDialogItem = criterion
@@ -720,6 +817,7 @@ private fun CriteriaPanel(
 private fun CriterionScoreRow(
     criterion: CriterionDto,
     point: Int,
+    isOnline: Boolean,
     isSaving: Boolean,
     onInfoClick: () -> Unit,
     onPointChanged: (Int) -> Unit,
@@ -789,12 +887,16 @@ private fun CriterionScoreRow(
             valueRange = 0f..criterion.maxPoints.toFloat().coerceAtLeast(0f),
             steps = (criterion.maxPoints - 1).coerceAtLeast(0),
             onValueChangeFinished = onCommit,
-            enabled = !isSaving && criterion.maxPoints > 0,
+            enabled = isOnline && !isSaving && criterion.maxPoints > 0,
             modifier = Modifier.fillMaxWidth()
         )
 
         Text(
-            text = if (isSaving) "Zapisywanie..." else "Zakres: 0..${criterion.maxPoints}",
+            text = when {
+                !isOnline -> "Brak internetu. Ocenianie zablokowane."
+                isSaving -> "Zapisywanie..."
+                else -> "Zakres: 0..${criterion.maxPoints}"
+            },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -831,6 +933,29 @@ private fun CriterionInfoDialog(
     )
 }
 
+@Composable
+private fun IncompleteScoresDialog(
+    message: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Nie wszystkie oceny są uzupełnione") },
+        text = { Text(message) },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Zostań")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text("Wyjdź mimo to")
+            }
+        }
+    )
+}
+
 private fun currentScore(
     state: JurorUiState,
     participantId: String,
@@ -838,4 +963,24 @@ private fun currentScore(
 ): Int {
     val key = scoreKey(participantId, criterionId)
     return state.draftScores[key] ?: state.scores[key] ?: 0
+}
+
+private fun hasIncompleteScores(
+    state: JurorUiState,
+    participantId: String,
+    selectedCategoryId: String?
+): Boolean {
+    val categoryId = selectedCategoryId ?: return false
+    val relevantCriteria = state.criteria.filter { it.categoryId == categoryId }
+
+    if (relevantCriteria.isEmpty()) return false
+
+    return relevantCriteria.any { criterion ->
+        val key = scoreKey(participantId, criterion.id)
+        key !in state.scores && key !in state.draftScores
+    }
+}
+
+private fun incompleteScoresMessage(selectedCategoryId: String?): String {
+    return "Nie wszystkie oceny w tej kategorii są jeszcze uzupełnione. Jeśli wyjdziesz teraz, wrócisz bez zapisania pełnego kompletu ocen."
 }
